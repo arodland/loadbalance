@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/golang/groupcache/lru"
@@ -29,19 +31,22 @@ type Server struct {
 	Cache     *lru.Cache
 }
 
-const numServers = 8
+const numServers = 100
 const numSlots = 8
-const requestsPerTick = 0.0105 * numServers * numSlots
+
 const itemParameter = 10000
 const cachedHandleTime = 10
 const uncachedHandleTime = 100
-const requestLimit = 10000000
+const requestLimit = 4000000
 const cacheSize = 1.8 * itemParameter / numServers
 const maxQueue = 50
+
+var requestsPerTick float64
 
 var tm int64
 var servers []*Server
 var poisson *rng.PoissonGenerator
+var ChooseServer func(Request) int
 
 func init() {
 	servers = make([]*Server, numServers)
@@ -56,6 +61,12 @@ func init() {
 	seed := time.Now().UnixNano()
 	rand.Seed(seed)
 	poisson = rng.NewPoissonGenerator(seed)
+	ChooseServer = choosePolicy[os.Args[1]]
+	var err error
+	requestsPerTick, err = strconv.ParseFloat(os.Args[2], 64)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func GenerateRequests() (ret []Request) {
@@ -71,9 +82,29 @@ func GenerateRequests() (ret []Request) {
 	return ret
 }
 
-func ChooseServer(r Request) int {
-	//	return int(r.Item % numServers)
-	return int(rand.Int31n(numServers))
+var rrIdx int
+
+var choosePolicy map[string]func(Request) int = map[string]func(Request) int{
+	"random": func(r Request) int {
+		return int(rand.Int31n(numServers))
+	},
+	"roundrobin": func(r Request) int {
+		x := rrIdx
+		rrIdx = (rrIdx + 1) % numServers
+		return x
+	},
+	"modulohash": func(r Request) int {
+		return int(r.Item % numServers)
+	},
+	"modchoose2": func(r Request) int {
+		first := int(r.Item % numServers)
+		second := ((first*int(r.Item) + 1) % numServers)
+		if servers[second].Outstanding()+16 < servers[first].Outstanding() {
+			return second
+		} else {
+			return first
+		}
+	},
 }
 
 func (s *Server) AddRequest(r Request) {
@@ -96,12 +127,18 @@ func (s *Server) HandleRequest(r Request) {
 	s.Slots[i].Full = true
 	r.Accepted = tm
 	_, cached := s.Cache.Get(r.Item)
+	var handleTime int64
 	if cached {
-		r.Completed = tm + cachedHandleTime
+		handleTime = cachedHandleTime
 		r.Cached = true
 	} else {
-		r.Completed = tm + uncachedHandleTime
+		handleTime = uncachedHandleTime
 	}
+	if s.SlotsUsed > numSlots/2 {
+		handleTime += (handleTime / numSlots) * int64(s.SlotsUsed-numSlots/2)
+	}
+	r.Completed = r.Accepted + handleTime
+
 	s.Slots[i].Request = r
 	s.SlotsUsed++
 	//	fmt.Printf("Enqueued request for %d in slot %d at time %d\n", r.Item, i, tm)
@@ -170,32 +207,41 @@ func Tick() {
 }
 
 func main() {
-	var prevCompletion int
+	var prevCompletion int = -1
+	var tmx float64
 
 	for {
 		Tick()
+		tmx += 1
 		var total int
 		for _, s := range servers {
 			total += s.Outstanding()
 		}
+		if tm == requestLimit/2 {
+			totalRequests = 0
+			acceptedRequests = 0
+			totalQueued = 0
+			totalTime = 0
+			totalCached = 0
+			tmx = 0
+		}
+
 		finish := total == 0 && tm >= requestLimit
 		completion := int(10 * tm / requestLimit)
 
-		if completion != prevCompletion || finish {
+		if acceptedRequests >= 1000 && completion != prevCompletion || finish {
 			prevCompletion = completion
-			fmt.Printf("tm=%d", tm)
 
-			if acceptedRequests > 0 {
-				fmt.Printf(" Requests: %.0f, Accepted %.0f (%.2f%%), Cache Hit %.2f%%, Avg Q: %.2f, Avg Tm: %.2f",
-					totalRequests,
-					acceptedRequests,
-					100*acceptedRequests/totalRequests,
-					100*totalCached/acceptedRequests,
-					totalQueued/acceptedRequests,
-					totalTime/acceptedRequests,
-				)
-			}
-			fmt.Println("")
+			fmt.Printf("tm=%d Requests: %.0f, Accepted %.0f (%.2f%%), Throughput %5f, Cache Hit %.2f%%, Avg Q: %.2f, Avg Tm: %.2f\n",
+				tm,
+				totalRequests,
+				acceptedRequests,
+				100*acceptedRequests/totalRequests,
+				acceptedRequests/tmx,
+				100*totalCached/acceptedRequests,
+				totalQueued/acceptedRequests,
+				totalTime/acceptedRequests,
+			)
 		}
 		if finish {
 			break
