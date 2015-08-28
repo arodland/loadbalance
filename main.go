@@ -35,7 +35,7 @@ const requestsPerTick = 0.0105 * numServers * numSlots
 const itemParameter = 10000
 const cachedHandleTime = 10
 const uncachedHandleTime = 100
-const requestLimit = 100000000
+const requestLimit = 10000000
 const cacheSize = 1.8 * itemParameter / numServers
 const maxQueue = 50
 
@@ -170,13 +170,19 @@ func Tick() {
 }
 
 func main() {
+	var prevCompletion int
+
 	for {
 		Tick()
 		var total int
 		for _, s := range servers {
 			total += s.Outstanding()
 		}
-		if tm%10000 == 0 {
+		finish := total == 0 && tm >= requestLimit
+		completion := int(10 * tm / requestLimit)
+
+		if completion != prevCompletion || finish {
+			prevCompletion = completion
 			fmt.Printf("tm=%d", tm)
 
 			if acceptedRequests > 0 {
@@ -191,7 +197,7 @@ func main() {
 			}
 			fmt.Println("")
 		}
-		if total == 0 && tm >= requestLimit {
+		if finish {
 			break
 		}
 	}
